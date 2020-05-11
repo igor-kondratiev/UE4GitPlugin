@@ -7,6 +7,7 @@
 
 #include "CoreMinimal.h"
 #include "GitSourceControlState.h"
+#include "HAL/PlatformProcess.h"
 
 class FGitSourceControlCommand;
 
@@ -32,6 +33,24 @@ private:
 };
 
 struct FGitVersion;
+
+// TODO: Move implementation into .cpp file
+class FGitNonBlockingCommand
+{
+public:
+    FGitNonBlockingCommand(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles);
+    void Start();
+    bool WaitResult(TArray<FString>& OutResults, TArray<FString>& OutErrorMessages, const int32 ExpectedReturnCode = 0);
+private:
+    int32 ReturnCode = 0;
+    FString PathToGitOrEnvBinary;
+    FString InCommand;
+    FString FullCommand;
+    FString LogableCommand; // short version of the command for logging purpose
+    FProcHandle ProcessHandle;
+    void* ReadPipe = nullptr;
+    void* WritePipe = nullptr;
+};
 
 namespace GitSourceControlUtils
 {

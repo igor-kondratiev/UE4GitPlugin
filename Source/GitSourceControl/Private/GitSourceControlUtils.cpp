@@ -53,6 +53,121 @@ const FString& FGitScopedTempFile::GetFilename() const
 }
 
 
+FGitNonBlockingCommand::FGitNonBlockingCommand(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles)
+{
+	// TODO: Support batching
+	check(InFiles.Num() <= GitSourceControlConstants::MaxFilesPerBatch);
+
+	this->InCommand = InCommand;
+
+	// Copy-Paste BEGIN
+	if (!InRepositoryRoot.IsEmpty())
+	{
+		FString RepositoryRoot = InRepositoryRoot;
+
+		// Detect a "migrate asset" scenario (a "git add" command is applied to files outside the current project)
+		if ((InFiles.Num() > 0) && !FPaths::IsRelative(InFiles[0]) && !InFiles[0].StartsWith(InRepositoryRoot))
+		{
+			// in this case, find the git repository (if any) of the destination Project
+			FString DestinationRepositoryRoot;
+			if (GitSourceControlUtils::FindRootDirectory(FPaths::GetPath(InFiles[0]), DestinationRepositoryRoot))
+			{
+				RepositoryRoot = DestinationRepositoryRoot; // if found use it for the "add" command (else not, to avoid producing one more error in logs)
+			}
+		}
+
+		// Specify the working copy (the root) of the git repository (before the command itself)
+		FullCommand = TEXT("-C \"");
+		FullCommand += RepositoryRoot;
+		FullCommand += TEXT("\" ");
+	}
+	// then the git command itself ("status", "log", "commit"...)
+	LogableCommand += InCommand;
+
+	// Append to the command all parameters, and then finally the files
+	for (const auto& Parameter : InParameters)
+	{
+		LogableCommand += TEXT(" ");
+		LogableCommand += Parameter;
+	}
+	for (const auto& File : InFiles)
+	{
+		LogableCommand += TEXT(" \"");
+		LogableCommand += File;
+		LogableCommand += TEXT("\"");
+	}
+	// Also, Git does not have a "--non-interactive" option, as it auto-detects when there are no connected standard input/output streams
+
+	FullCommand += LogableCommand;
+
+	//#if UE_BUILD_DEBUG
+	UE_LOG(LogSourceControl, Log, TEXT("RunCommand: 'git %s'"), *LogableCommand);
+	//#endif
+
+	PathToGitOrEnvBinary = InPathToGitBinary;
+#if PLATFORM_MAC
+	// The Cocoa application does not inherit shell environment variables, so add the path expected to have git-lfs to PATH
+	FString PathEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("PATH"));
+	FString GitInstallPath = FPaths::GetPath(InPathToGitBinary);
+
+	TArray<FString> PathArray;
+	PathEnv.ParseIntoArray(PathArray, FPlatformMisc::GetPathVarDelimiter());
+	bool bHasGitInstallPath = false;
+	for (auto Path : PathArray)
+	{
+		if (GitInstallPath.Equals(Path, ESearchCase::CaseSensitive))
+		{
+			bHasGitInstallPath = true;
+			break;
+		}
+	}
+
+	if (!bHasGitInstallPath)
+	{
+		PathToGitOrEnvBinary = FString("/usr/bin/env");
+		FullCommand = FString::Printf(TEXT("PATH=\"%s%s%s\" \"%s\" %s"), *GitInstallPath, FPlatformMisc::GetPathVarDelimiter(), *PathEnv, *InPathToGitBinary, *FullCommand);
+	}
+#endif
+}
+
+void FGitNonBlockingCommand::Start()
+{
+	// CreateProc
+	// FPlatformProcess::ExecProcess(*PathToGitOrEnvBinary, *FullCommand, &ReturnCode, &OutResults, &OutErrors);
+	FPlatformProcess::CreatePipe(ReadPipe, WritePipe);
+	ProcessHandle = FPlatformProcess::CreateProc(*PathToGitOrEnvBinary, *FullCommand, false, true, true, NULL, 0, NULL, WritePipe);
+}
+
+bool FGitNonBlockingCommand::WaitResult(TArray<FString>& OutResults, TArray<FString>& OutErrorMessages, const int32 ExpectedReturnCode)
+{
+	FString Results;
+	FString Errors;
+
+	FPlatformProcess::WaitForProc(ProcessHandle);
+	FPlatformProcess::GetProcReturnCode(ProcessHandle, &ReturnCode);
+	Results = FPlatformProcess::ReadPipe(ReadPipe);
+
+	Results.ParseIntoArray(OutResults, TEXT("\n"), true);
+	Errors.ParseIntoArray(OutErrorMessages, TEXT("\n"), true);
+
+	//#if UE_BUILD_DEBUG
+	UE_LOG(LogSourceControl, Log, TEXT("RunCommand(%s):\n%s"), *InCommand, *Results);
+	if (ReturnCode != ExpectedReturnCode || Errors.Len() > 0)
+	{
+		UE_LOG(LogSourceControl, Warning, TEXT("RunCommand(%s) ReturnCode=%d:\n%s"), *InCommand, ReturnCode, *Errors);
+	}
+	//#endif
+
+	// Move push/pull progress information from the error stream to the info stream
+	if (ReturnCode == ExpectedReturnCode && Errors.Len() > 0)
+	{
+		OutResults.Append(OutErrorMessages);
+		OutErrorMessages.Empty();
+	}
+
+	return ReturnCode == ExpectedReturnCode;
+}
+
 namespace GitSourceControlUtils
 {
 
@@ -1002,12 +1117,30 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 	TMap<FString, FString> LockedFiles;
 
 	// 0) Issue a "git lfs locks" command at the root of the repository
-	if(InUsingLfsLocking)
+	FGitNonBlockingCommand FetchLocksCmd(TEXT("lfs locks"), InPathToGitBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>());
+	if (InUsingLfsLocking)
+		FetchLocksCmd.Start();
+
+	// Get the current branch name, since we need origin of current branch
+	FString BranchName;
+	GitSourceControlUtils::GetBranchName(InPathToGitBinary, InRepositoryRoot, BranchName);
+
+	TArray<FString> ParametersLsRemote;
+	ParametersLsRemote.Add(TEXT("origin"));
+	ParametersLsRemote.Add(BranchName);
+	FGitNonBlockingCommand LsRemoteCmd(TEXT("ls-remote"), InPathToGitBinary, InRepositoryRoot, ParametersLsRemote, TArray<FString>());
+	if (!BranchName.IsEmpty())
+		LsRemoteCmd.Start();
+
+	// 0) Issue a "git lfs locks" command at the root of the repository
+	if (InUsingLfsLocking)
 	{
 		TArray<FString> Results;
 		TArray<FString> ErrorMessages;
-		bool bResult = RunCommand(TEXT("lfs locks"), InPathToGitBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, ErrorMessages);
-		for(const FString& Result : Results)
+		FetchLocksCmd.WaitResult(Results, ErrorMessages);
+
+		// bool bResult = RunCommand(TEXT("lfs locks"), InPathToGitBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, ErrorMessages);
+		for (const FString& Result : Results)
 		{
 			FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
 			// TODO LFS Debug log
@@ -1035,15 +1168,18 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 		}
 	}
 
-	// Get the current branch name, since we need origin of current branch
-	FString BranchName;
-	GitSourceControlUtils::GetBranchName(InPathToGitBinary, InRepositoryRoot, BranchName);
-
 	TArray<FString> Parameters;
 	Parameters.Add(TEXT("--porcelain"));
 	Parameters.Add(TEXT("--ignored"));
 
 	// 2) then we can batch git status operation by subdirectory
+	// LsRemote only once
+	TArray<FString> LsResults;
+	TArray<FString> LsErrorMessages;
+	bool bResultLsRemote = LsRemoteCmd.WaitResult(LsResults, LsErrorMessages);
+	// If the command is successful and there is only 1 line on the output the branch exists on remote
+	bool bDiffAgainstRemote = bResultLsRemote && (LsResults.Num() == 1);
+
 	for(const auto& Files : GroupOfFiles)
 	{
 		// "git status" can only detect renamed and deleted files when it operate on a folder, so use one folder path for all files in a directory
@@ -1074,17 +1210,9 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 		{
 			// Using git diff, we can obtain a list of files that were modified between our current origin and HEAD. Assumes that fetch has been run to get accurate info.
 			// TODO: should do a fetch (at least periodically).
+
 			TArray<FString> Results;
 			TArray<FString> ErrorMessages;
-			TArray<FString> ParametersLsRemote;
-			ParametersLsRemote.Add(TEXT("origin"));
-			ParametersLsRemote.Add(BranchName);
-			const bool bResultLsRemote = RunCommand(TEXT("ls-remote"), InPathToGitBinary, InRepositoryRoot, ParametersLsRemote, OnePath, Results, ErrorMessages);
-			// If the command is successful and there is only 1 line on the output the branch exists on remote
-			const bool bDiffAgainstRemote = bResultLsRemote && Results.Num();
-
-			Results.Reset();
-			ErrorMessages.Reset();
 			TArray<FString> ParametersDiff;
 			ParametersDiff.Add(TEXT("--name-only"));
 			ParametersDiff.Add(bDiffAgainstRemote ? FString::Printf(TEXT("origin/%s "), *BranchName) : BranchName);
