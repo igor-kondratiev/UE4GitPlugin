@@ -143,9 +143,14 @@ bool FGitNonBlockingCommand::WaitResult(TArray<FString>& OutResults, TArray<FStr
 	FString Results;
 	FString Errors;
 
+	while (FPlatformProcess::IsProcRunning(ProcessHandle))
+	{
+		FPlatformProcess::Sleep(0.0);
+		Results += FPlatformProcess::ReadPipe(ReadPipe);
+	}
 	FPlatformProcess::WaitForProc(ProcessHandle);
 	FPlatformProcess::GetProcReturnCode(ProcessHandle, &ReturnCode);
-	Results = FPlatformProcess::ReadPipe(ReadPipe);
+	Results += FPlatformProcess::ReadPipe(ReadPipe);
 
 	Results.ParseIntoArray(OutResults, TEXT("\n"), true);
 	Errors.ParseIntoArray(OutErrorMessages, TEXT("\n"), true);
