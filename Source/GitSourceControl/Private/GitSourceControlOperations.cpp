@@ -5,6 +5,7 @@
 
 #include "GitSourceControlOperations.h"
 
+#include "CoreMinimal.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
 #include "SourceControlOperations.h"
@@ -83,6 +84,11 @@ bool FGitCheckOutWorker::Execute(FGitSourceControlCommand& InCommand)
 {
 	check(InCommand.Operation->GetName() == GetName());
 
+	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
+	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
+
+	const FDateTime Now = FDateTime::Now();
+
 	if(InCommand.bUsingGitLfsLocking)
 	{
 		// lock files: execute the LFS command on relative filenames
@@ -92,11 +98,24 @@ bool FGitCheckOutWorker::Execute(FGitSourceControlCommand& InCommand)
 		{
 			TArray<FString> OneFile;
 			OneFile.Add(RelativeFile);
-			InCommand.bCommandSuccessful &= GitSourceControlUtils::RunCommand(TEXT("lfs lock"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), OneFile, InCommand.InfoMessages, InCommand.ErrorMessages);
+			bool bSuccess = GitSourceControlUtils::RunCommand(TEXT("lfs lock"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, TArray<FString>(), OneFile, InCommand.InfoMessages, InCommand.ErrorMessages);
+			InCommand.bCommandSuccessful &= bSuccess;
+			if (bSuccess)
+			{
+				FString AbsoluteFile = FPaths::Combine(InCommand.PathToRepositoryRoot, RelativeFile);
+				FPaths::NormalizeFilename(AbsoluteFile);
+				TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> FileState = Provider.GetStateInternal(AbsoluteFile, true);
+				FileState->LockState = ELockState::Locked;
+				FileState->LockUser = GitSourceControl.AccessSettings().GetLfsUserName();
+				FileState->TimeStamp = Now;
+				States.Add(*FileState);
+			}
 		}
 
 		// now update the status of our files
-		GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ErrorMessages, States);
+		// GitSourceControlUtils::RunUpdateStatus(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, InCommand.bUsingGitLfsLocking, InCommand.Files, InCommand.ErrorMessages, States);
+
+
 	}
 	else
 	{
